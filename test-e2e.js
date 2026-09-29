@@ -66,6 +66,8 @@ class Client {
     this.snapshot = null;
     this.lastError = null;
     this.joined = null;
+    this.kicked = null;
+    this.closed = false;
     this.ws.on('message', (raw) => {
       const msg = JSON.parse(raw);
       if (msg.type === 'snapshot') this.snapshot = msg.snapshot;
@@ -74,7 +76,11 @@ class Client {
         this.snapshot = msg.snapshot;
       }
       if (msg.type === 'error') this.lastError = msg;
+      if (msg.type === 'kicked') this.kicked = msg;
       this.queue.push(msg);
+    });
+    this.ws.on('close', () => {
+      this.closed = true;
     });
   }
   open() {
@@ -87,6 +93,7 @@ class Client {
     this.ws.send(JSON.stringify(obj));
   }
   close() {
+    if (this.closed) return Promise.resolve();
     return new Promise((res) => {
       this.ws.on('close', res);
       this.ws.close();
@@ -2436,6 +2443,129 @@ async function main() {
     assert.strictEqual(maBack.rootAnswer, answer, '重连后来源问题仍能找到最终答复');
 
     await ch.close(); await cAb.close(); await cB.close(); await cC.close();
+  }
+
+  // 31. 同身份在两个标签页接管房间：旧连接被 kicked 后迟到的命令/leave 不得影响
+  //     席位、版本与记录；旧连接关闭不得把新页标为离线
+  // 31a. 主持人凭 hostToken 接管
+  {
+    const created = await createRoom('接管主持');
+    const h1 = await hostJoin(created, '接管主持');
+    const g1 = await guestJoin(created.room, '观众甲');
+    await waitStable(h1, [g1]);
+    const hostId = created.participantId;
+    assert.strictEqual(h1.snapshot.hostId, hostId);
+
+    // 新标签页凭同一 hostToken 接管（第二个连接）
+    const h2 = new Client();
+    await h2.open();
+    h2.send({
+      type: 'join', room: created.room, nick: '接管主持',
+      participantId: hostId, hostToken: created.hostToken
+    });
+    await h1.waitFor((c) => c.kicked, 2000, '旧页应收到 kicked');
+    await h1.waitFor((c) => c.closed, 2000, '旧页连接应被服务端关闭');
+    await h2.waitFor((c) => c.joined && c.joined.you.host === true);
+    assert.strictEqual(h2.joined.you.id, hostId, '接管后仍是同一主持人席位');
+
+    // 新页在线，且接管本身不新增/删除席位（主持人 + 观众甲）
+    await g1.waitFor((c) => c.snapshot.participants.length === 2);
+    const hostInSnap = g1.snapshot.participants.find((p) => p.id === hostId);
+    assert.ok(hostInSnap && hostInSnap.online === true, '接管后主持人席位仍在线');
+
+    // 旧连接迟到的命令（用其能看到的最新版本）与 leave 一律静默丢弃：
+    // 无 error 回应、版本不动、席位仍在。以接管提交后新连接的版本为基线
+    // （接管本身会 commit 一次；旧连接 h1 的版本仍冻结在接管前）。
+    await g1.waitFor((c) => c.v === h2.v);
+    const vStale = h2.v;
+    h1.lastError = null;
+    h1.send({ type: 'request_speak', version: h1.v }); // 旧主持人身份的迟到命令
+    h1.send({ type: 'leave' });                        // 旧页迟到的主动退出
+    await sleep(200);
+    assert.strictEqual(h1.lastError, null, '旧连接的迟到命令应被静默丢弃，不回应 error');
+    assert.strictEqual(h2.v, vStale, '旧连接迟到操作不得改变版本');
+    assert.ok(
+      h2.snapshot.participants.some((p) => p.id === hostId),
+      '旧连接迟到的 leave 不得移除主持人席位'
+    );
+    assert.ok(!h2.snapshot.order.includes(hostId), '旧连接迟到命令不得改变队列');
+
+    // 旧连接关闭事件早已处理完：新页不得被标为离线
+    assert.strictEqual(
+      h2.snapshot.participants.find((p) => p.id === hostId).online,
+      true,
+      '旧连接关闭不得把新页标为离线'
+    );
+
+    // 只有当前连接能执行房间命令：新页的主持人命令正常生效
+    await hostCmd(h2, { type: 'clear_logs' });
+    assert.ok(h2.v > vStale, '新连接的主持人命令应正常推进版本');
+    // 旧连接（join 时是主持人）在被接管后再发主持人命令仍被静默丢弃：
+    // 先同步到当前版本，使其能越过版本守卫，从而真正验证连接归属守卫。
+    await g1.waitFor((c) => c.v === h2.v);
+    const vAfter = h2.v;
+    h1.lastError = null;
+    h1.send({ type: 'clear_logs', version: h2.v });
+    await sleep(200);
+    assert.strictEqual(h1.lastError, null, '旧连接的迟到主持人命令应被静默丢弃');
+    assert.strictEqual(h2.v, vAfter, '旧连接不得再执行主持人命令');
+
+    await h1.close();
+    await h2.close();
+    await g1.close();
+  }
+
+  // 31b. 参与者凭 participantId+secret 接管：旧页迟到 leave/命令不动席位，旧页关闭不标离线
+  {
+    const created = await createRoom();
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '接管观众');
+    await waitStable(h, [g1]);
+    const guestId = g1.joined.you.id;
+    const guestSecret = g1.joined.you.secret;
+
+    // 先排队，便于验证旧页迟到操作不动队列
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    assert.deepStrictEqual(h.snapshot.order, [guestId]);
+
+    // 新标签页凭同一 participantId+secret 接管
+    const g2 = new Client();
+    await g2.open();
+    g2.send({ type: 'join', room: created.room, nick: '接管观众', participantId: guestId, secret: guestSecret });
+    await g1.waitFor((c) => c.kicked, 2000, '旧页应收到 kicked');
+    await g1.waitFor((c) => c.closed, 2000, '旧页连接应被服务端关闭');
+    await g2.waitFor((c) => c.joined && c.joined.you.id === guestId);
+    assert.deepStrictEqual(g2.snapshot.order, [guestId], '接管后队列位置保留');
+
+    // 旧页迟到的 leave 与命令不得移除席位、不动版本/队列。
+    // 基线取接管提交后的当前版本（g1 冻结在接管前的旧版本）。
+    await h.waitFor((c) => g2.v === c.v);
+    const vStale = h.v;
+    g1.lastError = null;
+    g1.send({ type: 'leave' });
+    g1.send({ type: 'cancel_speak', version: g1.v });
+    await sleep(200);
+    assert.strictEqual(g1.lastError, null, '旧连接迟到命令应被静默丢弃');
+    assert.strictEqual(h.v, vStale, '旧连接迟到操作不得改变版本');
+    assert.deepStrictEqual(h.snapshot.order, [guestId], '旧连接迟到操作不得改变队列');
+    assert.strictEqual(
+      h.snapshot.participants.find((p) => p.id === guestId).online,
+      true,
+      '旧连接关闭不得把新页标为离线'
+    );
+
+    // 只有当前连接能继续操作：新页取消排队生效，主动退出移除席位
+    await waitStable(h, [g2]);
+    g2.send({ type: 'cancel_speak', version: g2.v });
+    await h.waitFor((c) => c.snapshot.order.length === 0);
+    g2.send({ type: 'leave' });
+    await h.waitFor((c) => !c.snapshot.participants.some((p) => p.id === guestId),
+      2000, '当前连接主动退出应移除席位');
+
+    await h.close();
+    await g1.close();
+    await g2.close();
   }
 
   // 15. 房间不存在

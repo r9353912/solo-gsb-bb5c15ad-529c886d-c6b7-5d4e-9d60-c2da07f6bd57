@@ -13,6 +13,9 @@ const state = {
   ws: null,
   connected: false,
   intentionalClose: false,
+  // 本连接被同身份的新标签页/设备接管（收到 kicked）：只退出本页，
+  // 不自动/后台重连，也不清共享凭据（凭据供新页刷新与断线恢复使用）
+  kicked: false,
   reconnectDelay: 500,
   reconnectTimer: null,
   clockOffset: 0, // 服务端时钟 - 本地时钟
@@ -323,6 +326,7 @@ function enterRoom(creds) {
   state.questionSeeded = false;
   state.questionSeen = new Map();
   state.intentionalClose = false;
+  state.kicked = false;
   state.reconnectDelay = 500;
 
   els.roomCode.textContent = creds.room;
@@ -358,7 +362,8 @@ function connect() {
 
   ws.addEventListener('close', () => {
     state.connected = false;
-    if (state.intentionalClose) return;
+    // 主动退出或被新标签页接管：不再自动重连（被接管时仅退出本页）
+    if (state.intentionalClose || state.kicked) return;
     setConn('offline');
     scheduleReconnect();
   });
@@ -369,6 +374,7 @@ function connect() {
 }
 
 function scheduleReconnect() {
+  if (state.kicked) return; // 被接管的旧页不再自动重连
   clearTimeout(state.reconnectTimer);
   els.connText.textContent = `连接断开，${Math.round(state.reconnectDelay / 100) / 10} 秒后重连…`;
   state.reconnectTimer = setTimeout(() => {
@@ -387,6 +393,8 @@ function sendJoin() {
 }
 
 function wsSend(obj) {
+  // 已被接管的旧页不再发出任何房间命令（服务端也会丢弃，这里先拦一次）
+  if (state.kicked) return false;
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify(obj));
     return true;
@@ -469,10 +477,14 @@ function handleMessage(msg) {
       if (msg.snapshot) applySnapshot(msg.snapshot);
       break;
     case 'kicked':
+      // 同一身份已在另一个标签页/设备接管本页：
+      // 仅退出本页，不自动/后台重连，也不清共享凭据——
+      // hostToken / participantId+secret 仍供新页刷新与断线恢复使用。
       toast(msg.reason || '你已在其他页面打开此房间', 'error');
+      state.kicked = true;
       state.intentionalClose = true;
+      clearTimeout(state.reconnectTimer);
       try { state.ws.close(); } catch { /* ignore */ }
-      clearCreds();
       setTimeout(showHome, 1000);
       break;
   }
@@ -2450,12 +2462,27 @@ async function copyText(text) {
 els.btnExit.addEventListener('click', () => {
   if (!confirm('确定退出房间？你的席位将被移除。')) return;
   state.intentionalClose = true;
-  wsSend({ type: 'leave' });
-  try { state.ws.close(); } catch { /* ignore */ }
-  clearCreds();
   clearTimeout(state.reconnectTimer);
-  showHome();
-  toast('已退出房间');
+  // 主动退出：先确保 leave 送达（当前连接才有权移除席位），再关闭连接并清凭据。
+  // 连接已在关闭中则等其关闭事件；未连接时直接清理本地凭据。
+  const finishExit = () => {
+    clearCreds();
+    showHome();
+    toast('已退出房间');
+  };
+  const ws = state.ws;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ type: 'leave' }));
+      ws.close();
+    } catch { /* ignore */ }
+    setTimeout(finishExit, 300);
+  } else if (ws && ws.readyState === WebSocket.CONNECTING) {
+    try { ws.close(); } catch { /* ignore */ }
+    finishExit();
+  } else {
+    finishExit();
+  }
 });
 
 // 页面卸载：主动断开（服务端会保留离线席位等待重连，不发送 leave）
@@ -2465,8 +2492,9 @@ window.addEventListener('beforeunload', () => {
 });
 
 // 从后台/休眠恢复时，WebSocket 可能已被系统静默断开：立即探测并重连
+// （被新标签页接管的旧页除外——它只退出本页，不再唤醒重连）
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible' || !state.creds) return;
+  if (document.visibilityState !== 'visible' || !state.creds || state.kicked) return;
   if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
     clearTimeout(state.reconnectTimer);
     state.intentionalClose = false;

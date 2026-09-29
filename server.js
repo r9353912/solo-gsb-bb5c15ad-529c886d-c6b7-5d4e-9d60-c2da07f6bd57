@@ -5,7 +5,8 @@
  *
  * 客户端 -> 服务端
  *   { type: "join",         room, nick }
- *   { type: "join",         room, nick, participantId, secret, hostToken }  // 断线重连
+ *   { type: "join",         room, nick, participantId, secret, hostToken }  // 断线重连 / 同身份接管
+ *   { type: "leave" }                                                       // 仅当前绑定连接可主动退出
  *   { type: "request_speak",  version }
  *   { type: "cancel_speak",   version }
  *   { type: "swap_invite",    version, participantId }  // 向另一名排队者发起换位邀请
@@ -46,8 +47,15 @@
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
+ *   { type: "kicked",  reason }   // 同一身份被更新的连接接管：本连接已失效，不得再执行命令/退出
  *   { type: "snapshot", snapshot }
  *   { type: "error",   error, code, snapshot? }
+ *
+ * 同身份接管（同一参与者在另一个标签页/设备凭 hostToken 或 participantId+secret
+ * 重新 join）：服务端把参与者绑定到最新连接并向旧连接下发 kicked 后关闭它。
+ * 此后只有当前绑定连接能执行房间命令与主动 leave；旧连接在被关闭前迟到的任何
+ * 命令或 leave 一律静默丢弃，不改变席位、版本与记录；旧连接关闭按断线处理也
+ * 不得把新连接标记为离线（参与者仍保持在线）。
  *
  * 所有队列命令必须携带客户端所见 version；服务端原子校验，
  * 不匹配则拒绝执行并返回最新快照（code = STALE_VERSION）。
@@ -1520,7 +1528,6 @@ app.get('/healthz', (_req, res) => res.json({ ok: true, rooms: rooms.size }));
 wss.on('connection', (ws) => {
   let room = null;
   let pid = null;
-  let isHost = false;
   ws.isAlive = true;
 
   ws.on('pong', () => {
@@ -1544,11 +1551,13 @@ wss.on('connection', (ws) => {
           return handleJoin(ws, msg, (ctx) => {
             room = ctx.room;
             pid = ctx.pid;
-            isHost = ctx.isHost;
           });
 
         case 'leave':
-          if (!room) return;
+          if (!room || !pid) return;
+          // 只有当前绑定连接能主动退出：被接管的旧连接迟到的 leave 一律忽略
+          const current = room.participants.get(pid);
+          if (!current || current.ws !== ws) return;
           return handleLeave(room, pid, 'leave');
 
         case 'request_speak':
@@ -1586,7 +1595,7 @@ wss.on('connection', (ws) => {
         case 'question_support':
         case 'question_merge':
         case 'question_close':
-          return handleCommand(ws, msg, room, pid, isHost);
+          return handleCommand(ws, msg, room, pid);
 
         default:
           return sendError(ws, `未知消息类型：${msg.type}`, 'UNKNOWN_TYPE', room);
@@ -1599,7 +1608,8 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (!room || !pid) return;
-    // 若该连接已被重连的新连接顶替，旧连接关闭时不做清理
+    // 仅当本连接仍是该身份的当前绑定连接时才按断线处理：
+    // 已被接管的旧连接关闭不做清理，新连接保持在线（不得误标离线）
     const current = room.participants.get(pid);
     if (!current || current.ws !== ws) return;
     handleLeave(room, pid, 'disconnect');
@@ -1821,10 +1831,17 @@ function requireHost(ws, room, isHost) {
   return true;
 }
 
-function handleCommand(ws, msg, room, pid, isHost) {
+/**
+ * 房间命令入口。主持人身份按 room.hostId 实时判定（同身份接管或主持人换绑后
+ * 不会沿用旧连接 join 时固化的标志）；命令只允许来自该参与者当前绑定的连接——
+ * 被接管（kicked）的旧连接在关闭前迟到的命令一律静默丢弃，不改变席位、版本与记录。
+ */
+function handleCommand(ws, msg, room, pid) {
   if (!room) return sendError(ws, '尚未加入房间', 'NOT_JOINED');
   const me = room.participants.get(pid);
   if (!me) return sendError(ws, '参与者不存在，请重新加入', 'NOT_JOINED');
+  if (me.ws !== ws) return; // 已被更新的连接接管：旧连接的迟到命令不执行、不回应
+  const isHost = room.hostId === pid;
 
   switch (msg.type) {
     case 'request_speak': {
