@@ -2438,6 +2438,129 @@ async function main() {
     await ch.close(); await cAb.close(); await cB.close(); await cC.close();
   }
 
+  // 31. 同身份在第二个标签页接管：旧连接被 kicked 后迟到的操作 / leave / 关闭均不得影响新页
+  await test('同身份接管：旧连接迟到的命令与 leave 不得改变席位/版本/记录，关闭不得标离线', async () => {
+    const createdT = await postJSON('/api/rooms', { nick: '接管主持' });
+    const roomT = createdT.body.room;
+
+    // 一名普通参与者先加入
+    const guest = new Client();
+    await guest.open();
+    guest.send({ type: 'join', room: roomT, nick: '阿丙' });
+    await guest.waitFor((c) => c.joined && c.joined.you.nick === '阿丙');
+    const guestId = guest.joined.you.id;
+    const guestSecret = guest.joined.you.secret;
+    const hostT = new Client();
+    await hostT.open();
+    hostT.send({ type: 'join', room: roomT, nick: '接管主持', participantId: createdT.body.participantId, hostToken: createdT.body.hostToken });
+    await hostT.waitFor((c) => c.joined && c.joined.you.host === true);
+
+    // 参与者先排进队列，制造旧连接迟到命令可改状态的机会
+    guest.send({ type: 'request_speak', version: guest.v });
+    await hostT.waitFor((c) => c.snapshot.order.includes(guestId));
+    const versionBefore = hostT.v;
+    const logsBefore = hostT.snapshot.logs.length;
+
+    // 旧连接：收到 kicked 的瞬间立即回发「迟到的 cancel_speak」（携带它最后持有的版本号，
+    // 恰好等于接管后的当前版本，足以绕过版本守卫）与「迟到的 leave」，模拟标签页关闭竞态
+    let guestKicked = null;
+    guest.ws.on('message', function onMsg(raw) {
+      const m = JSON.parse(raw);
+      if (m.type !== 'kicked') return;
+      guest.ws.off('message', onMsg);
+      guestKicked = m;
+      guest.send({ type: 'cancel_speak', version: guest.v });
+      guest.send({ type: 'leave' });
+    });
+    // 第二个标签页：凭 participantId + secret 接管
+    const guest2 = new Client();
+    await guest2.open();
+    guest2.send({ type: 'join', room: roomT, nick: '阿丙', participantId: guestId, secret: guestSecret });
+    await guest2.waitFor((c) => c.joined && c.joined.you.id === guestId);
+    await guest.waitFor(() => guestKicked !== null);
+    assert.strictEqual(guestKicked.type, 'kicked', '旧连接应收到 kicked');
+
+    // 等待旧连接关闭事件在服务端处理完毕（关闭也不得把新页标为离线）
+    await new Promise((r) => setTimeout(r, 200));
+
+    // 接管 join 本身有一次 presence 提交；此后迟到操作不得再推进版本
+    const versionAfterTakeover = hostT.v;
+    assert.ok(versionAfterTakeover > versionBefore, '接管 join 应有一次 presence 提交');
+    // 迟到 cancel_speak 不得改变队列、版本、记录
+    assert.ok(hostT.snapshot.order.includes(guestId), '旧连接迟到的取消操作不得改变队列');
+    assert.strictEqual(hostT.v, versionAfterTakeover, '旧连接迟到命令不得推进版本');
+    assert.strictEqual(hostT.snapshot.logs.length, logsBefore, '旧连接迟到命令不得写操作记录');
+    // 迟到 leave 不得删除席位
+    assert.ok(hostT.snapshot.participants.some((p) => p.id === guestId), '旧连接迟到 leave 不得删除席位');
+    // 旧连接关闭不得把新页标为离线
+    const meNow = hostT.snapshot.participants.find((p) => p.id === guestId);
+    assert.strictEqual(meNow.online, true, '旧连接关闭不得把接管中的新页标为离线');
+    // 新连接仍可正常执行房间命令
+    guest2.send({ type: 'cancel_speak', version: guest2.v });
+    await hostT.waitFor((c) => !c.snapshot.order.includes(guestId));
+    assert.strictEqual(hostT.v, versionAfterTakeover + 1, '当前连接的命令应正常生效并推进版本');
+
+    // 主持人同身份接管：旧主持连接迟到的主持人命令（clear_logs）不得生效，迟到 leave 不得移除主持席位
+    let hostKicked = null;
+    hostT.ws.on('message', function onMsg(raw) {
+      const m = JSON.parse(raw);
+      if (m.type !== 'kicked') return;
+      hostT.ws.off('message', onMsg);
+      hostKicked = m;
+      // 用旧连接收到的最后一版快照版本（接管 join 广播），足以绕过版本守卫
+      hostT.send({ type: 'clear_logs', version: hostT.v });
+      hostT.send({ type: 'leave' });
+    });
+    const host2 = new Client();
+    await host2.open();
+    host2.send({ type: 'join', room: roomT, nick: '接管主持', participantId: createdT.body.participantId, hostToken: createdT.body.hostToken });
+    await host2.waitFor((c) => c.joined && c.joined.you.host === true && c.joined.you.id === createdT.body.participantId);
+    await hostT.waitFor(() => hostKicked !== null);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const logsAfterKick = host2.snapshot.logs.length;
+    const logsAfterKickBeforeClear = Math.max(...host2.snapshot.logs.map((l) => l.ts));
+    assert.ok(logsAfterKick > 0, '旧主持迟到的 clear_logs 不得清空操作记录');
+    assert.ok(
+      host2.snapshot.participants.some((p) => p.id === createdT.body.participantId && p.online),
+      '旧主持迟到 leave / 关闭不得移除或置离线新主持席位'
+    );
+    // 新主持仍可执行主持人命令：clear_logs 生效（旧记录被清空；commit 本身不再写日志，
+    // 之后若有 presence 类提交可能追加新记录，因此以版本推进 + 旧记录消失为准）
+    const hostVerBeforeClear = host2.v;
+    host2.send({ type: 'clear_logs', version: host2.v });
+    await host2.waitFor((c) => c.v > hostVerBeforeClear);
+    assert.ok(
+      !host2.snapshot.logs.some((l) => l.ts <= logsAfterKickBeforeClear),
+      '当前主持人的 clear_logs 应清空旧操作记录'
+    );
+
+    // 参与者席位仍在（新连接），且当前连接主动退出仍正常移除席位
+    assert.ok(host2.snapshot.participants.some((p) => p.id === guestId), '参与者席位保持');
+    guest2.send({ type: 'leave' });
+    await host2.waitFor((c) => !c.snapshot.participants.some((p) => p.id === guestId));
+    assert.ok(!host2.snapshot.participants.some((p) => p.id === guestId), '当前连接主动退出应移除席位');
+
+    await host2.close();
+  });
+
+  // 32. 普通断线仍保留席位（回归确认）
+  await test('普通断线保留席位并标记离线，凭 id+secret 重连恢复', async () => {
+    const createdR = await postJSON('/api/rooms', { nick: '断线主持' });
+    const c = new Client();
+    await c.open();
+    c.send({ type: 'join', room: createdR.body.room, nick: '断线主持', participantId: createdR.body.participantId, hostToken: createdR.body.hostToken });
+    await c.waitFor((x) => x.joined && x.joined.you.host === true);
+    await c.close();
+    // 主持人本人断线：席位保留、标记离线
+    const probe = new Client();
+    await probe.open();
+    probe.send({ type: 'join', room: createdR.body.room, nick: '断线主持', participantId: createdR.body.participantId, hostToken: createdR.body.hostToken });
+    await probe.waitFor((x) => x.joined && x.snapshot.participants.some((p) => p.id === createdR.body.participantId && p.online));
+    assert.ok(probe.snapshot.participants.some((p) => p.id === createdR.body.participantId), '断线后席位保留');
+    await probe.close();
+  });
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();

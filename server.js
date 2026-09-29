@@ -47,7 +47,17 @@
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
  *   { type: "snapshot", snapshot }
+ *   { type: "kicked",  reason }   // 同一身份在其他标签页/设备 join 接管：旧连接收到后
+ *                                 // 被服务端关闭；旧连接此后迟到的命令与 leave 一律忽略，
+ *                                 // 关闭也不影响新连接的席位与在线状态。
  *   { type: "error",   error, code, snapshot? }
+ *
+ * 同一身份的多标签页/设备接管：参与者凭 participantId+secret、主持人凭 hostToken 重新
+ * join 即顶替旧连接。接管后只有当前绑定连接能执行房间命令与主动退出：旧连接在被 kicked
+ * 到真正关闭之间（CLOSING 状态仍可能派发迟到消息）发来的任何命令（含不带版本守卫的
+ * leave）都经连接归属守卫静默丢弃，不改席位、版本与操作记录；旧连接关闭只走断线路径，
+ * 但因 current.ws 已指向新连接而完全不产生清理。当前连接主动 leave 仍移除席位；普通
+ * 断线（未被接管）仍保留席位、标记离线等待重连。
  *
  * 所有队列命令必须携带客户端所见 version；服务端原子校验，
  * 不匹配则拒绝执行并返回最新快照（code = STALE_VERSION）。
@@ -1476,6 +1486,19 @@ function commit(room, opts = {}) {
   }
 }
 
+/**
+ * 连接归属守卫：同一身份已被新连接接管（join 重绑定 p.ws）后，
+ * 旧连接上迟到的任何消息——包括普通命令与不带版本守卫的 leave——
+ * 一律忽略，不得再沿原闭包绑定的身份改变席位、版本或操作记录。
+ * 版本守卫之外再补这一道连接级守卫，覆盖被 kicked 后到旧 socket
+ * 真正关闭之间（CLOSING 状态仍会派发 message）的竞态窗口。
+ */
+function isCurrentConnection(room, pid, ws) {
+  if (!room || !pid) return false;
+  const current = room.participants.get(pid);
+  return !!current && current.ws === ws;
+}
+
 function sendError(ws, message, code, room) {
   const msg = { type: 'error', error: message, code };
   if (room) msg.snapshot = buildSnapshot(room);
@@ -1548,7 +1571,8 @@ wss.on('connection', (ws) => {
           });
 
         case 'leave':
-          if (!room) return;
+          // 被新连接接管后迟到的 leave 不得删除新页正在使用的席位
+          if (!isCurrentConnection(room, pid, ws)) return;
           return handleLeave(room, pid, 'leave');
 
         case 'request_speak':
@@ -1655,7 +1679,18 @@ function handleJoin(ws, msg, bind) {
       return commit(target, { undoReason: 'presence_changed' });
     }
 
-    // id 对不上（例如本地身份丢失）：以新成员身份进入并接管为主持人
+    // id 对不上（例如本地身份丢失）：以新成员身份进入并接管为主持人。
+    // 原主持人若仍连着，旧连接同样让出：此后只有当前连接能执行主持人命令与退出，
+    // 旧连接迟到的消息由连接归属守卫拦截。
+    const prevHost = target.hostId ? target.participants.get(target.hostId) : null;
+    if (prevHost && prevHost.ws && prevHost.ws !== ws) {
+      if (prevHost.ws.readyState === OPEN) {
+        send(prevHost.ws, { type: 'kicked', reason: '主持身份已在其他标签页/设备接管' });
+      }
+      prevHost.ws.close(1000, 'replaced');
+      prevHost.online = false;
+      prevHost.ws = null;
+    }
     const nick = String(msg.nick ?? '').trim().slice(0, 20) || '主持人';
     const id = genId('p_');
     const participant = {
@@ -1825,6 +1860,9 @@ function handleCommand(ws, msg, room, pid, isHost) {
   if (!room) return sendError(ws, '尚未加入房间', 'NOT_JOINED');
   const me = room.participants.get(pid);
   if (!me) return sendError(ws, '参与者不存在，请重新加入', 'NOT_JOINED');
+  // 连接归属守卫：身份已被其他标签页/设备接管后，旧连接迟到的命令一律忽略
+  // （静默丢弃，不返回错误也不改变任何状态，避免与新页的快照流交错）
+  if (me.ws !== ws) return;
 
   switch (msg.type) {
     case 'request_speak': {

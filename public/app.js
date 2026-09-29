@@ -13,6 +13,9 @@ const state = {
   ws: null,
   connected: false,
   intentionalClose: false,
+  // 本连接已被同身份的其他标签页/设备接管（收到 kicked）：停止自动及后台唤醒重连，
+  // 只退出本页；共享凭据保留在 localStorage 供新页刷新/断线恢复
+  kicked: false,
   reconnectDelay: 500,
   reconnectTimer: null,
   clockOffset: 0, // 服务端时钟 - 本地时钟
@@ -323,6 +326,7 @@ function enterRoom(creds) {
   state.questionSeeded = false;
   state.questionSeen = new Map();
   state.intentionalClose = false;
+  state.kicked = false;
   state.reconnectDelay = 500;
 
   els.roomCode.textContent = creds.room;
@@ -358,7 +362,8 @@ function connect() {
 
   ws.addEventListener('close', () => {
     state.connected = false;
-    if (state.intentionalClose) return;
+    // 被新标签页接管后退出：不自动重连（见 handleMessage 的 kicked 分支）
+    if (state.intentionalClose || state.kicked) return;
     setConn('offline');
     scheduleReconnect();
   });
@@ -469,10 +474,16 @@ function handleMessage(msg) {
       if (msg.snapshot) applySnapshot(msg.snapshot);
       break;
     case 'kicked':
+      // 同一身份已在其他标签页/设备打开：只退出本页。
+      // - 停止自动重连与后台唤醒重连（state.kicked 同时拦住 close 与 visibilitychange）；
+      // - 不删除 localStorage 中的共享凭据——新页刷新、断线恢复还要用它接管；
+      // - 本页解除内存中的凭据引用，避免残留代码再以该身份发消息。
       toast(msg.reason || '你已在其他页面打开此房间', 'error');
+      state.kicked = true;
       state.intentionalClose = true;
+      clearTimeout(state.reconnectTimer);
       try { state.ws.close(); } catch { /* ignore */ }
-      clearCreds();
+      state.creds = null;
       setTimeout(showHome, 1000);
       break;
   }
@@ -2464,9 +2475,10 @@ window.addEventListener('beforeunload', () => {
   try { state.ws.close(); } catch { /* ignore */ }
 });
 
-// 从后台/休眠恢复时，WebSocket 可能已被系统静默断开：立即探测并重连
+// 从后台/休眠恢复时，WebSocket 可能已被系统静默断开：立即探测并重连。
+// 被 kicked（身份已被其他标签页接管）后不再唤醒重连，只停留在已退出的首页。
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible' || !state.creds) return;
+  if (document.visibilityState !== 'visible' || !state.creds || state.kicked) return;
   if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
     clearTimeout(state.reconnectTimer);
     state.intentionalClose = false;
